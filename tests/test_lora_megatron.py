@@ -24,7 +24,7 @@ import torch.nn.init as init
 
 from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
 
-from .testing_utils import require_torch_gpu
+# from .testing_utils import require_torch_gpu
 
 
 def is_megatron_available() -> bool:
@@ -33,16 +33,17 @@ def is_megatron_available() -> bool:
 
 if is_megatron_available():
     from megatron.core import parallel_state, tensor_parallel
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear, TELayerNormColumnParallelLinear
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.module import MegatronModule
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    world_size = 1
-    rank = 0
-
+    world_size = int(os.environ['WORLD_SIZE'])
+    rank = int(os.environ["RANK"])
+    
     def initialize_distributed():
         print(f"Initializing torch.distributed with rank: {rank}, world_size: {world_size}")
-        torch.cuda.set_device(0)
+        torch.cuda.set_device(rank)
         init_method = "tcp://"
         master_ip = os.getenv("MASTER_ADDR", "localhost")
         master_port = os.getenv("MASTER_PORT", "6001")
@@ -72,15 +73,17 @@ if is_megatron_available():
     class DummyModule(MegatronModule):
         def __init__(self, config: TransformerConfig):
             super().__init__(config)
-            self.linear = tensor_parallel.ColumnParallelLinear(
+            self.linear = TELayerNormColumnParallelLinear(
                 input_size=10,
                 output_size=10,
                 config=config,
                 init_method=init.xavier_normal_,
                 bias=False,
                 gather_output=False,
+                skip_bias_add=True,
+                is_expert=False,
             )
-            self.lm_head = tensor_parallel.RowParallelLinear(
+            self.lm_head = TERowParallelLinear(
                 input_size=10,
                 output_size=10,
                 config=config,
@@ -88,6 +91,7 @@ if is_megatron_available():
                 bias=False,
                 input_is_parallel=True,
                 skip_bias_add=True,
+                is_expert=False,
             )
 
         def forward(self, input):
@@ -95,20 +99,25 @@ if is_megatron_available():
             x = self.lm_head(x)[0]
             return x
 
-    @require_torch_gpu
+    # @require_torch_gpu
     class TestMegatronLora(unittest.TestCase):
         def setUp(self):
-            initialize_model_parallel(1, 1)
+            tp_size = 2
+            initialize_model_parallel(tp_size, 1)
             model_parallel_cuda_manual_seed(123)
             transformer_config = {
                 "num_layers": 2,
                 "hidden_size": 12,
                 "num_attention_heads": 4,
                 "use_cpu_initialization": True,
+                "tensor_model_parallel_size": tp_size,
+                "sequence_parallel": True
             }
             config = TransformerConfig(**transformer_config)
             self.megatron_module = DummyModule(config=config).cuda()
-            self.dummy_module = copy.deepcopy(self.megatron_module).cuda()
+            self.dummy_module = self.megatron_module
+            
+            del self.megatron_module.config
 
             lora_config = LoraConfig(
                 lora_alpha=16,
@@ -120,6 +129,7 @@ if is_megatron_available():
                 megatron_core="megatron.core",
             )
             self.megatron_module = get_peft_model(self.megatron_module, lora_config)
+            self.dummy_module.config = config
 
         def tearDown(self):
             destroy_model_parallel()
@@ -142,13 +152,14 @@ if is_megatron_available():
                 if name.endswith("lm_head.lora_B.default"):
                     assert isinstance(module, torch.nn.Linear)
 
-        def test_forward(self):
-            x = torch.ones((2, 4, 10)).cuda()
+        def test_forward(self, after_backward=False):
+            x = torch.randn((2, 4, 10)).cuda()
             megatron_module_result = self.megatron_module(x)
-            dummt_module_result = self.dummy_module(x)
+            with self.megatron_module.disable_adapter():
+                dummt_module_result = self.megatron_module(x)
 
             # Because lora_B is initialized with 0, the forward results of two models should be equal before backward.
-            assert megatron_module_result.equal(dummt_module_result)
+            assert megatron_module_result.equal(dummt_module_result) ^ after_backward
 
         def test_backward(self):
             optimizer = torch.optim.AdamW(self.megatron_module.parameters())
@@ -169,3 +180,11 @@ if is_megatron_available():
 
             for key in peft_state_dict.keys():
                 assert "lora" in key
+
+if __name__ == "__main__":
+    test = TestMegatronLora()
+    test.setUp()
+    test.test_forward()
+    test.test_backward()
+    # print(list(test.megatron_module.named_parameters()))
+    test.test_forward(after_backward=True)
